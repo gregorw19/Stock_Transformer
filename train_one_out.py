@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import DataLoader, TensorDataset, Dataset, RandomSampler
 import pandas as pd
-from model import *
+from model_one import *
 import itertools
 import numpy as np
 
@@ -56,6 +56,7 @@ labels_avgs = pd.read_csv("Stock_Transformer/answers_avgs.csv")[columns].values
 # Reshape arrays
 data_array = data_array.reshape(2070805, input_days, num_cols)  # (2070805, 10, 7)
 labels_array = labels_array.reshape(2070805, input_days, num_cols)
+labels_array = labels_array[:, :1, :]
 data_avgs = data_avgs.reshape(2070805, num_cols, 2)  # (2070805, 7, 2)
 labels_avgs = labels_avgs.reshape(2070805, num_cols, 2)
 print("Arrays Loaded")
@@ -104,6 +105,7 @@ checkpoint_file = "checkpoint.pth"
 
 try:
     model, optimizer, start_epoch = load_checkpoint(checkpoint_file)
+    model = model.to(device)
 except FileNotFoundError:
     print("No checkpoint found, starting from scratch")
 
@@ -166,4 +168,4 @@ for epoch in range(start_epoch, num_epochs):
     # Save checkpoint
     save_checkpoint(model, optimizer, epoch, checkpoint_file)
 
-torch.save(model.state_dict(), "Minute_Stock_Transformer.pth")
+torch.save(model.state_dict(), "Minute_Stock_Transformer_One.pth")

@@ -3,6 +3,7 @@ from torch.utils.data import DataLoader, TensorDataset, Dataset, RandomSampler
 import pandas as pd
 from model import *
 import itertools
+import numpy as np
 
 def save_checkpoint(model, optimizer, epoch, filename="checkpoint.pth"):
     state = {
@@ -38,12 +39,31 @@ class StockDataset(Dataset):
 input_days = 10
 num_cols = 7
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
 
-# Load and reshape data
-data_array = pd.read_csv("train.csv").values.reshape(-1, input_days, num_cols)
-labels_array = pd.read_csv("answers.csv").values.reshape(-1, input_days, num_cols)
-data_avgs = pd.read_csv("train_avgs.csv").values.reshape(-1, input_days, num_cols)
-labels_avgs = pd.read_csv("answers_avgs.csv").values.reshape(-1, input_days, num_cols)
+# Define the list of columns you want to select
+columns = ["Mean1", "Standard_Deviation1", "Mean2", "Standard_Deviation2", 
+           "Mean3", "Standard_Deviation3", "Mean4", "Standard_Deviation4", 
+           "Mean5", "Standard_Deviation5", "Mean6", "Standard_Deviation6", 
+           "Mean7", "Standard_Deviation7"]
+
+# Load data
+data_array = pd.read_csv("Stock_Transformer/train.csv").values
+labels_array = pd.read_csv("Stock_Transformer/answers.csv").values
+data_avgs = pd.read_csv("Stock_Transformer/train_avgs.csv")[columns].values
+labels_avgs = pd.read_csv("Stock_Transformer/answers_avgs.csv")[columns].values
+
+# Reshape arrays
+data_array = data_array.reshape(2070805, input_days, num_cols)  # (2070805, 10, 7)
+labels_array = labels_array.reshape(2070805, input_days, num_cols)
+data_avgs = data_avgs.reshape(2070805, num_cols, 2)  # (2070805, 7, 2)
+labels_avgs = labels_avgs.reshape(2070805, num_cols, 2)
+print("Arrays Loaded")
+
+print(f"data_array shape after reshape: {data_array.shape}")
+print(f"labels_array shape after reshape: {labels_array.shape}")
+print(f"data_avgs shape after reshape: {data_avgs.shape}")
+print(f"labels_avgs shape after reshape: {labels_avgs.shape}")
 
 # Convert dataframes to tensors and move to GPU if available
 features_tensor = torch.tensor(data_array, dtype=torch.float32).to(device)
@@ -63,8 +83,8 @@ sampler = RandomSampler(dataset, generator=torch.Generator().manual_seed(seed))
 sampler_avgs = RandomSampler(dataset_avgs, generator=torch.Generator().manual_seed(seed))
 
 # Create dataloaders with the same sampler
-dataloader = DataLoader(dataset, batch_size=32, sampler=sampler)
-dataloader_avgs = DataLoader(dataset_avgs, batch_size=32, sampler=sampler_avgs)
+dataloader = DataLoader(dataset, batch_size=64, sampler=sampler)
+dataloader_avgs = DataLoader(dataset_avgs, batch_size=64, sampler=sampler_avgs)
 
 print("Datasets loaded")
 
@@ -75,7 +95,7 @@ criterion = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 print("Transformer built")
 
-num_epochs = 50
+num_epochs = 25
 clip_value = 1.0  # Gradient clipping value
 
 # To load from a checkpoint
@@ -98,15 +118,44 @@ for epoch in range(start_epoch, num_epochs):
         optimizer.zero_grad()
         current_features = batch_features.clone()
 
+        # Check for NaN values in data
+        if torch.isnan(batch_features).any() or torch.isnan(batch_labels).any() or torch.isnan(batch_features_avgs).any() or torch.isnan(batch_labels_avgs).any():
+            continue
+
         # Normalize input features
-        batch_features_normalized = (batch_features - batch_features_avgs) / (batch_features_avgs + 1e-8)
+        batch_features_normalized = torch.zeros_like(batch_features).to(device)
+        batch_labels_normalized = torch.zeros_like(batch_labels).to(device)
+
+        # Loop over each feature
+        for i in range(7):
+            features_mean = batch_features_avgs[:, i, 0].unsqueeze(1)  # Shape: [32, 1]
+            features_std = batch_features_avgs[:, i, 1].unsqueeze(1)   # Shape: [32, 1]
+            
+            labels_mean = batch_labels_avgs[:, i, 0].unsqueeze(1)      # Shape: [32, 1]
+            labels_std = batch_labels_avgs[:, i, 1].unsqueeze(1)       # Shape: [32, 1]
+
+            # Normalize the i-th feature across all samples and time steps
+            batch_features_normalized[:, :, i] = (batch_features[:, :, i] - features_mean) / (features_std + 1e-8)
+            batch_labels_normalized[:, :, i] = (batch_labels[:, :, i] - labels_mean) / (labels_std + 1e-8)
 
         # Forward pass
         outputs = model.encode(batch_features_normalized, None)  # Encode the current features
         outputs = model.project(outputs)  # Project the encoded features to the output space
 
         # Denormalize outputs
-        outputs_denormalized = outputs * (batch_labels_avgs + 1e-8) + batch_labels_avgs
+        outputs_denormalized = torch.zeros_like(outputs).to(device)
+
+        # Loop over each feature to denormalize
+        for i in range(7):
+            labels_mean = batch_labels_avgs[:, i, 0].unsqueeze(1).expand_as(outputs[:, :, i])  # Shape: [32, 10]
+            labels_std = batch_labels_avgs[:, i, 1].unsqueeze(1).expand_as(outputs[:, :, i])   # Shape: [32, 10]
+
+            # Denormalize the i-th feature across all samples and time steps
+            outputs_denormalized[:, :, i] = outputs[:, :, i] * (labels_std + 1e-8) + labels_mean
+
+        # Check for NaN values in outputs
+        if torch.isnan(outputs).any() or torch.isnan(outputs_denormalized).any():
+            continue
 
         # Compute the loss comparing the denormalized outputs to the original labels
         loss = criterion(outputs_denormalized, batch_labels)
