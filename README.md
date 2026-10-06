@@ -3,8 +3,8 @@
 This repository implements Transformer-based neural networks for **minute-level stock price forecasting**.  
 It includes two main model variants:
 
-1. **Full Sequence Model (`model.py`)** – predicts the next *10 minutes* (a 10×7 sequence) from the previous 10 one-minute bars.  
-2. **One-Out Model (`model_one.py`)** – predicts only the *next minute* (a 1×7 output) from the previous 10 one-minute bars.
+1. **Full Sequence Model (`model.py`)** – predicts the next 10 minutes (a 10×7 sequence) from the previous 10 one-minute bars.  
+2. **One-Out Model (`model_one.py`)** – predicts only the next minute (a 1×7 output) from the previous 10 one-minute bars.
 
 Both architectures use **Time2Vec positional encoding** and **multi-head self-attention** to capture temporal dependencies and inter-feature relationships in multivariate stock time series.
 
