@@ -39,7 +39,7 @@ $$
 \text{Time2Vec}(t) = [w_0 t + b_0, \sin(w_1 t + b_1), \ldots, \sin(w_k t + b_k)]
 $$
 
-This allows the model to capture both **linear** and **periodic** components of time.
+This allows the model to capture both linear and periodic components of time.
 
 ### Transformer Encoder
 
@@ -120,13 +120,13 @@ The configuration file `config.py` defines experiment parameters and paths:
    Loads preprocessed `train.csv`, `answers.csv`, and their average normalization files.
 
 2. **Chronological Train/Test Split (80/20)**  
-   The data is a time series of overlapping sliding windows, so it is **not** split randomly. A random split would put near-copies of each test sample in the training set and make the test loss look better than it really is. Instead:
+   The data is a time series of overlapping sliding windows, so it is not split randomly. A random split would put near-copies of each test sample in the training set and make the test loss look better than it really is. Instead:
    - The first 80% of windows are the training set and the last 20% are the test set, so the model is always tested on a period after the one it trained on.
    - A gap of `2 * input_days` (20) windows is skipped between the two sets. Each window covers 10 input steps plus 10 label steps, so without the gap the first test windows would share minutes with the last training windows.
    - Batches are shuffled only within the training set. The test set stays in time order.
 
 3. **Normalization (10-minute model)**    
-   Each input window is normalized by its own per-feature mean and standard deviation. The model's outputs are converted back to the original scale with the **same input-window statistics**. The label window's statistics are never used, because they describe the future and are not available at prediction time.
+   Each input window is normalized by its own per-feature mean and standard deviation. The model's outputs are converted back to the original scale with the same input-window statistics. The label window's statistics are never used, because they describe the future and are not available at prediction time.
 
 4. **Model Initialization**  
    Builds the Transformer using:
