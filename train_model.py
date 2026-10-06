@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import DataLoader, TensorDataset, Dataset, RandomSampler
+from torch.utils.data import DataLoader, TensorDataset, Dataset, Subset
 import pandas as pd
 from model import *
 import itertools
@@ -15,14 +15,15 @@ def save_checkpoint(model, optimizer, epoch, filename="checkpoint.pth"):
     print(f"Checkpoint saved at epoch {epoch+1}")
 
 def load_checkpoint(filename="checkpoint.pth"):
-    checkpoint = torch.load(filename)
-    model = build_transformer(seq_len=input_days, d_model=140, features=num_cols)
+    checkpoint = torch.load(filename, map_location=device)
+    model = build_transformer(seq_len=input_days, d_model=140, features=num_cols).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     epoch = checkpoint['epoch']
     print(f"Checkpoint loaded from epoch {epoch+1}")
-    return model, optimizer, epoch
+    # The saved epoch already finished, so resume from the next one
+    return model, optimizer, epoch + 1
 
 class StockDataset(Dataset):
     def __init__(self, features, labels):
@@ -71,20 +72,25 @@ labels_tensor = torch.tensor(labels_array, dtype=torch.float32).to(device)
 features_avgs_tensor = torch.tensor(data_avgs, dtype=torch.float32).to(device)
 labels_avgs_tensor = torch.tensor(labels_avgs, dtype=torch.float32).to(device)
 
-# Load dataset
-dataset = TensorDataset(features_tensor, labels_tensor)
-dataset_avgs = TensorDataset(features_avgs_tensor, labels_avgs_tensor)
+# Load dataset (features, labels and their avgs stay aligned in one dataset)
+dataset = TensorDataset(features_tensor, labels_tensor, features_avgs_tensor, labels_avgs_tensor)
+
+# Chronological 80/20 split: train on the earlier 80%, test on the later 20%.
+# Windows overlap with stride 1, so skip a gap of 2 * input_days samples so no
+# test window shares any minutes with a training window's inputs or labels.
+num_samples = len(dataset)
+split_idx = int(num_samples * 0.8)
+gap = 2 * input_days
+train_dataset = Subset(dataset, range(0, split_idx))
+test_dataset = Subset(dataset, range(split_idx + gap, num_samples))
+print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
 
 # Seed for reproducibility
 seed = 42
 
-# Create a RandomSampler with the same seed
-sampler = RandomSampler(dataset, generator=torch.Generator().manual_seed(seed))
-sampler_avgs = RandomSampler(dataset_avgs, generator=torch.Generator().manual_seed(seed))
-
-# Create dataloaders with the same sampler
-dataloader = DataLoader(dataset, batch_size=64, sampler=sampler)
-dataloader_avgs = DataLoader(dataset_avgs, batch_size=64, sampler=sampler_avgs)
+# Shuffle only within the training set; keep the test set in time order
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, generator=torch.Generator().manual_seed(seed))
+test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
 print("Datasets loaded")
 
@@ -100,12 +106,67 @@ clip_value = 1.0  # Gradient clipping value
 
 # To load from a checkpoint
 start_epoch = 0
-checkpoint_file = "checkpoint.pth"
+# Per-script name, so old checkpoints (trained on all data, before the
+# train/test split) and the other training script's checkpoints are never resumed
+checkpoint_file = "checkpoint_train_model.pth"
 
 try:
     model, optimizer, start_epoch = load_checkpoint(checkpoint_file)
 except FileNotFoundError:
     print("No checkpoint found, starting from scratch")
+
+def compute_loss(batch_features, batch_labels, batch_features_avgs, batch_labels_avgs):
+    """Runs a forward pass on one batch. Returns None if the batch contains NaNs."""
+    # Check for NaN values in data
+    if torch.isnan(batch_features).any() or torch.isnan(batch_labels).any() or torch.isnan(batch_features_avgs).any() or torch.isnan(batch_labels_avgs).any():
+        return None
+
+    # Normalize input features
+    batch_features_normalized = torch.zeros_like(batch_features).to(device)
+
+    # Loop over each feature
+    for i in range(7):
+        features_mean = batch_features_avgs[:, i, 0].unsqueeze(1)  # Shape: [32, 1]
+        features_std = batch_features_avgs[:, i, 1].unsqueeze(1)   # Shape: [32, 1]
+
+        # Normalize the i-th feature across all samples and time steps
+        batch_features_normalized[:, :, i] = (batch_features[:, :, i] - features_mean) / (features_std + 1e-8)
+
+    # Forward pass
+    outputs = model.encode(batch_features_normalized, None)  # Encode the current features
+    outputs = model.project(outputs)  # Project the encoded features to the output space
+
+    # Denormalize outputs
+    outputs_denormalized = torch.zeros_like(outputs).to(device)
+
+    # Loop over each feature to denormalize. Use the input window's stats: the label
+    # window's stats describe the future and aren't available at prediction time.
+    for i in range(7):
+        features_mean = batch_features_avgs[:, i, 0].unsqueeze(1).expand_as(outputs[:, :, i])  # Shape: [32, 10]
+        features_std = batch_features_avgs[:, i, 1].unsqueeze(1).expand_as(outputs[:, :, i])   # Shape: [32, 10]
+
+        # Denormalize the i-th feature across all samples and time steps
+        outputs_denormalized[:, :, i] = outputs[:, :, i] * (features_std + 1e-8) + features_mean
+
+    # Check for NaN values in outputs
+    if torch.isnan(outputs).any() or torch.isnan(outputs_denormalized).any():
+        return None
+
+    # Compute the loss comparing the denormalized outputs to the original labels
+    return criterion(outputs_denormalized, batch_labels)
+
+def evaluate(loader):
+    model.eval()
+    total_loss = 0
+    num_batches = 0
+    with torch.no_grad():
+        for batch in loader:
+            loss = compute_loss(*batch)
+            if loss is None:
+                continue
+            total_loss += loss.item()
+            num_batches += 1
+    return total_loss / max(num_batches, 1)
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -114,51 +175,12 @@ for epoch in range(start_epoch, num_epochs):
     total_loss = 0
     progress = 0
 
-    for (batch_features, batch_labels), (batch_features_avgs, batch_labels_avgs) in zip(dataloader, dataloader_avgs):
+    for batch in train_loader:
         optimizer.zero_grad()
-        current_features = batch_features.clone()
 
-        # Check for NaN values in data
-        if torch.isnan(batch_features).any() or torch.isnan(batch_labels).any() or torch.isnan(batch_features_avgs).any() or torch.isnan(batch_labels_avgs).any():
+        loss = compute_loss(*batch)
+        if loss is None:
             continue
-
-        # Normalize input features
-        batch_features_normalized = torch.zeros_like(batch_features).to(device)
-        batch_labels_normalized = torch.zeros_like(batch_labels).to(device)
-
-        # Loop over each feature
-        for i in range(7):
-            features_mean = batch_features_avgs[:, i, 0].unsqueeze(1)  # Shape: [32, 1]
-            features_std = batch_features_avgs[:, i, 1].unsqueeze(1)   # Shape: [32, 1]
-            
-            labels_mean = batch_labels_avgs[:, i, 0].unsqueeze(1)      # Shape: [32, 1]
-            labels_std = batch_labels_avgs[:, i, 1].unsqueeze(1)       # Shape: [32, 1]
-
-            # Normalize the i-th feature across all samples and time steps
-            batch_features_normalized[:, :, i] = (batch_features[:, :, i] - features_mean) / (features_std + 1e-8)
-            batch_labels_normalized[:, :, i] = (batch_labels[:, :, i] - labels_mean) / (labels_std + 1e-8)
-
-        # Forward pass
-        outputs = model.encode(batch_features_normalized, None)  # Encode the current features
-        outputs = model.project(outputs)  # Project the encoded features to the output space
-
-        # Denormalize outputs
-        outputs_denormalized = torch.zeros_like(outputs).to(device)
-
-        # Loop over each feature to denormalize
-        for i in range(7):
-            labels_mean = batch_labels_avgs[:, i, 0].unsqueeze(1).expand_as(outputs[:, :, i])  # Shape: [32, 10]
-            labels_std = batch_labels_avgs[:, i, 1].unsqueeze(1).expand_as(outputs[:, :, i])   # Shape: [32, 10]
-
-            # Denormalize the i-th feature across all samples and time steps
-            outputs_denormalized[:, :, i] = outputs[:, :, i] * (labels_std + 1e-8) + labels_mean
-
-        # Check for NaN values in outputs
-        if torch.isnan(outputs).any() or torch.isnan(outputs_denormalized).any():
-            continue
-
-        # Compute the loss comparing the denormalized outputs to the original labels
-        loss = criterion(outputs_denormalized, batch_labels)
 
         total_loss += loss.item()
 
@@ -175,8 +197,9 @@ for epoch in range(start_epoch, num_epochs):
         if progress % 1000 == 0:
             print(f'Progress: {progress} batches processed')
 
-    avg_loss = total_loss / len(dataloader)
-    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}')
+    avg_loss = total_loss / len(train_loader)
+    test_loss = evaluate(test_loader)
+    print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_loss:.4f}, Test Loss: {test_loss:.4f}')
 
     # Save checkpoint
     save_checkpoint(model, optimizer, epoch, checkpoint_file)

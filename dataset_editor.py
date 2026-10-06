@@ -6,9 +6,11 @@ df = pd.read_csv("Stock_Transformer/Data/oneMinData/1_min_SPY_2008-2021.csv")
 num_cols = 7
 df = df[['open', 'high', 'low', 'close', 'volume', 'barCount', 'average']]
 
-# Calculate the means and standard deviations for each column
-means = df.mean()
-stds = df.std()
+# Calculate the means and standard deviations for each column using only the
+# first 80% of rows (the training period), so no test-period data leaks into the scaling
+train_rows = int(len(df) * 0.8)
+means = df.iloc[:train_rows].mean()
+stds = df.iloc[:train_rows].std()
 
 # Standardize the DataFrame
 standardized_df = (df - means) / stds
