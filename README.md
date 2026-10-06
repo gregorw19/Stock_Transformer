@@ -3,8 +3,8 @@
 This repository implements Transformer-based neural networks for **minute-level stock price forecasting**.  
 It includes two main model variants:
 
-1. **Full Sequence Model (`model.py`)** – predicts the next *10 days* (a 10×7 sequence).  
-2. **One-Out Model (`model_one.py`)** – predicts only the *next single day* (a 1×7 output) based on a 10-day input.
+1. **Full Sequence Model (`model.py`)** – predicts the next *10 minutes* (a 10×7 sequence) from the previous 10 one-minute bars.  
+2. **One-Out Model (`model_one.py`)** – predicts only the *next minute* (a 1×7 output) from the previous 10 one-minute bars.
 
 Both architectures use **Time2Vec positional encoding** and **multi-head self-attention** to capture temporal dependencies and inter-feature relationships in multivariate stock time series.
 
@@ -15,13 +15,15 @@ Both architectures use **Time2Vec positional encoding** and **multi-head self-at
 ```
 ├── config.py                      # Model hyperparameters and paths
 ├── dataset_editor.py              # Data preprocessing and normalization script
-├── model.py                       # Transformer predicting 10 days of output
-├── model_one.py                   # Transformer predicting 1 day of output
-├── train_model.py                 # Training script for the 10-day model
+├── model.py                       # Transformer predicting the next 10 minutes
+├── model_one.py                   # Transformer predicting the next minute
+├── train_model.py                 # Training script for the 10-minute model
 ├── train_one_out.py               # Training script for the one-out model
-├── model_use.py                   # Example inference script
-├── Minute_Stock_Transformer.pth   # Weights for 10-day model
-├── Minute_Stock_Transformer_One.pth  # Weights for one-out model
+├── tmodel.py                      # Reference encoder-decoder Transformer for token sequences (not used)
+├── test_time2vec.py               # Standalone Time2Vec experiment
+├── torch_cuda_check.py            # Prints CUDA availability and GPU info
+├── Minute_Stock_Transformer.pth   # Weights for the 10-minute model
+├── Minute_Stock_Transformer_One.pth  # Weights for the one-out model
 ```
 
 ---
@@ -49,8 +51,8 @@ Each model includes multiple encoder layers that consist of:
 
 ### Output Projection
 
-- **Full Sequence Model:** outputs `(batch_size, 10, 7)` — predicting all 10 days at once  
-- **One-Out Model:** outputs `(batch_size, 1, 7)` — predicting only the next day
+- **Full Sequence Model:** outputs `(batch_size, 10, 7)` — predicting all 10 minutes at once  
+- **One-Out Model:** outputs `(batch_size, 1, 7)` — predicting only the next minute
 
 ---
 
@@ -76,9 +78,10 @@ All preprocessing is handled by `dataset_editor.py`.
    $$
    z = \frac{x - \mu}{\sigma}
    $$
+   The mean and standard deviation are computed from the **first 80% of rows only** (the training period) and then applied to all rows, so no information from the test period leaks into the scaling.
 
 4. **Generate Sliding Windows**  
-   Creates overlapping 10-day windows:
+   Creates overlapping 10-minute windows (one window per minute):
    ```
    (num_samples, 10, 7)
    ```
@@ -116,29 +119,50 @@ The configuration file `config.py` defines experiment parameters and paths:
 1. **Data Loading**  
    Loads preprocessed `train.csv`, `answers.csv`, and their average normalization files.
 
-2. **Model Initialization**  
+2. **Chronological Train/Test Split (80/20)**  
+   The data is a time series of overlapping sliding windows, so it is **not** split randomly. A random split would put near-copies of each test sample in the training set and make the test loss look better than it really is. Instead:
+   - The first 80% of windows are the training set and the last 20% are the test set, so the model is always tested on a period after the one it trained on.
+   - A gap of `2 * input_days` (20) windows is skipped between the two sets. Each window covers 10 input steps plus 10 label steps, so without the gap the first test windows would share minutes with the last training windows.
+   - Batches are shuffled only within the training set. The test set stays in time order.
+
+3. **Normalization (10-minute model)**    
+   Each input window is normalized by its own per-feature mean and standard deviation. The model's outputs are converted back to the original scale with the **same input-window statistics**. The label window's statistics are never used, because they describe the future and are not available at prediction time.
+
+4. **Model Initialization**  
    Builds the Transformer using:
    ```python
    model = build_transformer(seq_len=10, d_model=140, features=7)
    ```
 
-3. **Loss and Optimizer**
+5. **Loss and Optimizer**
    - Loss: Mean Squared Error (MSE)
    - Optimizer: Adam (learning rate = 1e-4)
 
-4. **Gradient Clipping**
+6. **Gradient Clipping**
    Stabilizes training with `torch.nn.utils.clip_grad_norm_`.
 
-5. **Checkpointing**
-   Saves model and optimizer states every epoch to `checkpoint.pth`.
+7. **Evaluation**  
+   After each epoch the model is evaluated on the test set (with `model.eval()` and no gradients), and both the train and test loss are printed:
+   ```
+   Epoch [1/25], Train Loss: ..., Test Loss: ...
+   ```
 
-6. **Model Output**
-   - 10-day model → `Minute_Stock_Transformer.pth`
+8. **Checkpointing**
+   Saves model and optimizer states every epoch. Each script uses its own checkpoint file so it never resumes from the other script's model, or from an old `checkpoint.pth` trained before the train/test split:
+   - 10-minute model → `checkpoint_train_model.pth`
+   - One-out model → `checkpoint_train_one_out.pth`
+
+   When a checkpoint is found, training resumes at the epoch after the one that was saved.
+
+9. **Model Output**
+   - 10-minute model → `Minute_Stock_Transformer.pth`
    - One-out model → `Minute_Stock_Transformer_One.pth`
+
+> **Note:** The included `.pth` weights were trained before the train/test split and normalization changes, on the full dataset. Retrain both models before relying on any test results.
 
 ### Example Commands
 
-Train the 10-day model:
+Train the 10-minute model:
 ```bash
 python train_model.py
 ```
@@ -152,33 +176,56 @@ python train_one_out.py
 
 ## Inference
 
-To run predictions on new data:
+The `Transformer` class has no `forward()` method, so call `encode` and then `project`, the same way the training scripts do.
+
+### 10-minute model
+
+This model was trained on inputs normalized by each window's own per-feature mean and standard deviation, so do the same at inference and use those statistics to convert the output back to the original scale.
 
 ```python
-from model import build_transformer
 import torch
-import pandas as pd
+from model import build_transformer
 
-# Load model
 model = build_transformer(seq_len=10, d_model=140, features=7)
-model.load_state_dict(torch.load("Minute_Stock_Transformer.pth", map_location='cpu'))
+model.load_state_dict(torch.load("Minute_Stock_Transformer.pth", map_location="cpu"))
 model.eval()
 
-# Example 10×7 input matrix
+# The last 10 one-minute bars, oldest first:
+# open, high, low, close, volume, barCount, average
 data = [
     [89.45, 89.46, 89.37, 89.37, 7872, 2102, 89.424],
     [89.38, 89.53, 89.37, 89.50, 5336, 1938, 89.468],
-    ...
+    ...  # 8 more rows
 ]
-features_tensor = torch.tensor(data, dtype=torch.float32).unsqueeze(0)
+x = torch.tensor(data, dtype=torch.float32).unsqueeze(0)  # (1, 10, 7)
 
-# Predict
-output = model(features_tensor)
+# Normalize each feature by this window's own mean and standard deviation
+means = x.mean(dim=1, keepdim=True)
+stds = x.std(dim=1, keepdim=True)
+x_norm = (x - means) / (stds + 1e-8)
+
+with torch.no_grad():
+    out = model.project(model.encode(x_norm, None))  # (1, 10, 7)
+
+# Convert back to the original scale with the same input-window statistics
+prediction = out * (stds + 1e-8) + means
 ```
 
-To restore original scale:
+The mean and standard deviation should be computed the same way as the values in `train_avgs.csv` that the model was trained with.
+
+### One-out model
+
+This model was trained on raw, unnormalized values, so the input goes in as-is and the output is already in the original scale.
+
 ```python
-df_out = (df_pred * stds) + means
+from model_one import build_transformer
+
+model = build_transformer(seq_len=10, d_model=140, features=7)
+model.load_state_dict(torch.load("Minute_Stock_Transformer_One.pth", map_location="cpu"))
+model.eval()
+
+with torch.no_grad():
+    prediction = model.project(model.encode(x, None))  # (1, 1, 7)
 ```
 
 ---
@@ -189,13 +236,13 @@ df_out = (df_pred * stds) + means
 
 - **Input:** `(batch_size, 10, 7)`  
 - **Output:** `(batch_size, 10, 7)`  
-- **Use case:** multi-step forecasting of the next 10 days
+- **Use case:** multi-step forecasting of the next 10 minutes
 
 ### One-Out Model (`model_one.py`)
 
 - **Input:** `(batch_size, 10, 7)`  
 - **Output:** `(batch_size, 1, 7)`  
-- **Use case:** single-step forecasting of the next day
+- **Use case:** single-step forecasting of the next minute
 
 ---
 
