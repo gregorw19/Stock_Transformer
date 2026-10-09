@@ -56,13 +56,14 @@ class Time2Vec(nn.Module):
 '''
 
 class Time2Vec(nn.Module):
-    def __init__(self, features, k, output_dim):
+    def __init__(self, features, k, output_dim, seq_len):
         super(Time2Vec, self).__init__()
         self.features = features
         self.k = k
         self.output_dim = output_dim
         self.linear = nn.Parameter(torch.randn(features))  # Linear component weights
         self.periodic = nn.ParameterList([nn.Parameter(torch.randn(features)) for _ in range(k)])  # Periodic components weights
+        self.position = nn.Parameter(torch.zeros(seq_len, output_dim))  # Learned embedding of each minute's position in the window
 
     def forward(self, x):
         batch_size, seq_len, features = x.size()
@@ -82,8 +83,8 @@ class Time2Vec(nn.Module):
         # Ensure output_dim is achieved
         if time2vec_out.shape[-1] != self.output_dim:
             time2vec_out = time2vec_out[:, :, :self.output_dim]  # Adjust to match output_dim
-        
-        return time2vec_out
+
+        return time2vec_out + self.position  # Without this, attention can't tell which minute is newest
 
 
 
@@ -215,7 +216,7 @@ class ProjectionLayer(nn.Module):
 
     def forward(self, x):
         # (Batch, seq_len, d_model) -> (Batch, 1, features)
-        return self.proj(x[:, :1, :])  # Only take the first time step
+        return self.proj(x[:, -1:, :])  # Only take the newest time step
     
 
 class Transformer(nn.Module):
@@ -238,8 +239,8 @@ class Transformer(nn.Module):
 def build_transformer(seq_len: int, d_model: int, features: int, N: int = 6, h: int = 7, dropout: float = 0.1, d_ff: int = 2048): 
 
     # create positional encoding layers
-    src_pos = Time2Vec(features, k=20, output_dim = d_model)
-    tgt_pos = Time2Vec(features, k=20, output_dim = d_model)
+    src_pos = Time2Vec(features + 1, k=20, output_dim = d_model, seq_len = seq_len)  # +1 input column for the time of day
+    tgt_pos = Time2Vec(features, k=20, output_dim = d_model, seq_len = seq_len)
 
     # create encoder blocks
     encoder_blocks = []

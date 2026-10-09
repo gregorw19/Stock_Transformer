@@ -56,13 +56,14 @@ class Time2Vec(nn.Module):
 '''
 
 class Time2Vec(nn.Module):
-    def __init__(self, features, k, output_dim):
+    def __init__(self, features, k, output_dim, seq_len):
         super(Time2Vec, self).__init__()
         self.features = features
         self.k = k
         self.output_dim = output_dim
         self.linear = nn.Parameter(torch.randn(features))  # Linear component weights
         self.periodic = nn.ParameterList([nn.Parameter(torch.randn(features)) for _ in range(k)])  # Periodic components weights
+        self.position = nn.Parameter(torch.zeros(seq_len, output_dim))  # Learned embedding of each minute's position in the window
 
     def forward(self, x):
         batch_size, seq_len, features = x.size()
@@ -82,8 +83,8 @@ class Time2Vec(nn.Module):
         # Ensure output_dim is achieved
         if time2vec_out.shape[-1] != self.output_dim:
             time2vec_out = time2vec_out[:, :, :self.output_dim]  # Adjust to match output_dim
-        
-        return time2vec_out
+
+        return time2vec_out + self.position  # Without this, attention can't tell which minute is newest
 
 
 
@@ -206,13 +207,15 @@ class Encoder(nn.Module):
 
 class ProjectionLayer(nn.Module):
 
-    def __init__(self, d_model: int, features: int) -> None:
+    def __init__(self, d_model: int, features: int, seq_len: int) -> None:
         super().__init__()
-        self.proj = nn.Sequential(nn.Linear(d_model, d_model*2), nn.Tanh(), nn.Linear(d_model*2, features))
+        self.seq_len = seq_len
+        self.features = features
+        self.proj = nn.Sequential(nn.Linear(d_model, d_model*2), nn.Tanh(), nn.Linear(d_model*2, seq_len * features))
 
     def forward(self, x):
-        # (Batch, seq_len, d_model) -> (Batch, seq_len, features)
-        return self.proj(x)
+        # (Batch, seq_len, d_model) -> (Batch, seq_len, features), all predicted from the newest minute
+        return self.proj(x[:, -1, :]).view(-1, self.seq_len, self.features)
     
 
 class Transformer(nn.Module):
@@ -235,8 +238,8 @@ class Transformer(nn.Module):
 def build_transformer(seq_len: int, d_model: int, features: int, N: int = 6, h: int = 7, dropout: float = 0.1, d_ff: int = 2048): 
 
     # create positional encoding layers
-    src_pos = Time2Vec(features, k=20, output_dim = d_model)
-    tgt_pos = Time2Vec(features, k=20, output_dim = d_model)
+    src_pos = Time2Vec(features + 1, k=20, output_dim = d_model, seq_len = seq_len)  # +1 input column for the time of day
+    tgt_pos = Time2Vec(features, k=20, output_dim = d_model, seq_len = seq_len)
 
     # create encoder blocks
     encoder_blocks = []
@@ -250,7 +253,7 @@ def build_transformer(seq_len: int, d_model: int, features: int, N: int = 6, h: 
     encoder = Encoder(nn.ModuleList(encoder_blocks))
 
     # create projection layer
-    projection_layer = ProjectionLayer(d_model, features)
+    projection_layer = ProjectionLayer(d_model, features, seq_len)
 
     # create the transformer
     transformer = Transformer(encoder, src_pos, tgt_pos, projection_layer)

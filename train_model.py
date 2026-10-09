@@ -1,15 +1,18 @@
 import torch
 from torch.utils.data import DataLoader, TensorDataset, Dataset, Subset
+from pathlib import Path
 import pandas as pd
 from model import *
+from dataset_editor import load_windows, input_days
 import itertools
 import numpy as np
 
-def save_checkpoint(model, optimizer, epoch, filename="checkpoint.pth"):
+def save_checkpoint(model, optimizer, epoch, best_val_loss, filename="checkpoint.pth"):
     state = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'best_val_loss': best_val_loss,
     }
     torch.save(state, filename)
     print(f"Checkpoint saved at epoch {epoch+1}")
@@ -23,7 +26,7 @@ def load_checkpoint(filename="checkpoint.pth"):
     epoch = checkpoint['epoch']
     print(f"Checkpoint loaded from epoch {epoch+1}")
     # The saved epoch already finished, so resume from the next one
-    return model, optimizer, epoch + 1
+    return model, optimizer, epoch + 1, checkpoint['best_val_loss']
 
 class StockDataset(Dataset):
     def __init__(self, features, labels):
@@ -37,60 +40,55 @@ class StockDataset(Dataset):
         return self.features[idx], self.labels[idx]
 
 # Configuration
-input_days = 10
 num_cols = 7
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 
-# Define the list of columns you want to select
-columns = ["Mean1", "Standard_Deviation1", "Mean2", "Standard_Deviation2", 
-           "Mean3", "Standard_Deviation3", "Mean4", "Standard_Deviation4", 
-           "Mean5", "Standard_Deviation5", "Mean6", "Standard_Deviation6", 
-           "Mean7", "Standard_Deviation7"]
+# Paths are relative to this file, so the script works from any working directory
+project_dir = Path(__file__).resolve().parent
 
-# Load data
-data_array = pd.read_csv("Stock_Transformer/train.csv").values
-labels_array = pd.read_csv("Stock_Transformer/answers.csv").values
-data_avgs = pd.read_csv("Stock_Transformer/train_avgs.csv")[columns].values
-labels_avgs = pd.read_csv("Stock_Transformer/answers_avgs.csv")[columns].values
-
-# Reshape arrays
-data_array = data_array.reshape(2070805, input_days, num_cols)  # (2070805, 10, 7)
-labels_array = labels_array.reshape(2070805, input_days, num_cols)
-data_avgs = data_avgs.reshape(2070805, num_cols, 2)  # (2070805, 7, 2)
-labels_avgs = labels_avgs.reshape(2070805, num_cols, 2)
+# Load the raw input and label windows built by dataset_editor.py
+data_array, labels_array, window_times, hours_array = load_windows()
 print("Arrays Loaded")
 
-print(f"data_array shape after reshape: {data_array.shape}")
-print(f"labels_array shape after reshape: {labels_array.shape}")
-print(f"data_avgs shape after reshape: {data_avgs.shape}")
-print(f"labels_avgs shape after reshape: {labels_avgs.shape}")
+print(f"data_array shape: {data_array.shape}")  # (num_windows, 10, 7)
+print(f"labels_array shape: {labels_array.shape}")  # (num_windows, 10, 7)
 
-# Convert dataframes to tensors and move to GPU if available
+# Convert arrays to tensors and move to GPU if available
 features_tensor = torch.tensor(data_array, dtype=torch.float32).to(device)
 labels_tensor = torch.tensor(labels_array, dtype=torch.float32).to(device)
-features_avgs_tensor = torch.tensor(data_avgs, dtype=torch.float32).to(device)
-labels_avgs_tensor = torch.tensor(labels_avgs, dtype=torch.float32).to(device)
+hours_tensor = torch.tensor(hours_array, dtype=torch.float32).to(device)
 
-# Load dataset (features, labels and their avgs stay aligned in one dataset)
-dataset = TensorDataset(features_tensor, labels_tensor, features_avgs_tensor, labels_avgs_tensor)
+# Load dataset (features, labels and times of day stay aligned in one dataset)
+dataset = TensorDataset(features_tensor, labels_tensor, hours_tensor)
 
-# Chronological 80/20 split: train on the earlier 80%, test on the later 20%.
-# Windows overlap with stride 1, so skip a gap of 2 * input_days samples so no
-# test window shares any minutes with a training window's inputs or labels.
+# Chronological 70/10/20 split: train on the earliest 70%, pick the best epoch on the
+# next 10% (validation), and leave the last 20% untouched for evaluate.py (test).
+# Windows overlap with stride 1, so skip a gap of 2 * input_days samples between sets
+# so no window shares any minutes with a window in another set.
 num_samples = len(dataset)
+val_idx = int(num_samples * 0.7)
 split_idx = int(num_samples * 0.8)
 gap = 2 * input_days
-train_dataset = Subset(dataset, range(0, split_idx))
+train_dataset = Subset(dataset, range(0, val_idx))
+val_dataset = Subset(dataset, range(val_idx + gap, split_idx))
 test_dataset = Subset(dataset, range(split_idx + gap, num_samples))
-print(f"Train samples: {len(train_dataset)}, Test samples: {len(test_dataset)}")
+print(f"Train samples: {len(train_dataset)} ({window_times[0]} to {window_times[val_idx - 1]})")
+print(f"Validation samples: {len(val_dataset)} ({window_times[val_idx + gap]} to {window_times[split_idx - 1]})")
+print(f"Test samples: {len(test_dataset)} ({window_times[split_idx + gap]} to {window_times[-1]})")
+
+# Floor for the loss scale in compute_loss: the 5th percentile of each feature's
+# input-window std over the training set. Without it, a near-flat window (std close
+# to 0) turns even a small move after it into a huge error that swamps the loss.
+train_stds = data_array[:val_idx].std(axis=1, ddof=1)  # Sample std, same as torch.std
+std_floor = torch.tensor(np.percentile(train_stds, 5, axis=0), dtype=torch.float32, device=device)  # Shape: [7]
 
 # Seed for reproducibility
 seed = 42
 
-# Shuffle only within the training set; keep the test set in time order
+# Shuffle only within the training set; keep the validation set in time order
 train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, generator=torch.Generator().manual_seed(seed))
-test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
 
 print("Datasets loaded")
 
@@ -108,52 +106,49 @@ clip_value = 1.0  # Gradient clipping value
 start_epoch = 0
 # Per-script name, so old checkpoints (trained on all data, before the
 # train/test split) and the other training script's checkpoints are never resumed
-checkpoint_file = "checkpoint_train_model.pth"
+checkpoint_file = project_dir / "checkpoint_train_model.pth"
+# The weights from the epoch with the lowest validation loss are saved here
+model_file = project_dir / "trained_models" / "Minute_Stock_Transformer.pth"
+model_file.parent.mkdir(exist_ok=True)
+best_val_loss = float('inf')
 
 try:
-    model, optimizer, start_epoch = load_checkpoint(checkpoint_file)
+    model, optimizer, start_epoch, best_val_loss = load_checkpoint(checkpoint_file)
 except FileNotFoundError:
     print("No checkpoint found, starting from scratch")
 
-def compute_loss(batch_features, batch_labels, batch_features_avgs, batch_labels_avgs):
+def compute_loss(batch_features, batch_labels, batch_hours):
     """Runs a forward pass on one batch. Returns None if the batch contains NaNs."""
     # Check for NaN values in data
-    if torch.isnan(batch_features).any() or torch.isnan(batch_labels).any() or torch.isnan(batch_features_avgs).any() or torch.isnan(batch_labels_avgs).any():
+    if torch.isnan(batch_features).any() or torch.isnan(batch_labels).any():
         return None
 
-    # Normalize input features
-    batch_features_normalized = torch.zeros_like(batch_features).to(device)
+    # Normalize each input window by its own per-feature mean and standard deviation
+    features_mean = batch_features.mean(dim=1, keepdim=True)  # Shape: [batch, 1, 7]
+    features_std = batch_features.std(dim=1, keepdim=True)    # Shape: [batch, 1, 7]
+    batch_features_normalized = (batch_features - features_mean) / (features_std + 1e-8)
 
-    # Loop over each feature
-    for i in range(7):
-        features_mean = batch_features_avgs[:, i, 0].unsqueeze(1)  # Shape: [32, 1]
-        features_std = batch_features_avgs[:, i, 1].unsqueeze(1)   # Shape: [32, 1]
-
-        # Normalize the i-th feature across all samples and time steps
-        batch_features_normalized[:, :, i] = (batch_features[:, :, i] - features_mean) / (features_std + 1e-8)
+    # Add each minute's time of day as an extra, unnormalized input column
+    model_inputs = torch.cat([batch_features_normalized, batch_hours.unsqueeze(-1)], dim=-1)  # Shape: [batch, 10, 8]
 
     # Forward pass
-    outputs = model.encode(batch_features_normalized, None)  # Encode the current features
+    outputs = model.encode(model_inputs, None)  # Encode the current features
     outputs = model.project(outputs)  # Project the encoded features to the output space
 
-    # Denormalize outputs
-    outputs_denormalized = torch.zeros_like(outputs).to(device)
-
-    # Loop over each feature to denormalize. Use the input window's stats: the label
-    # window's stats describe the future and aren't available at prediction time.
-    for i in range(7):
-        features_mean = batch_features_avgs[:, i, 0].unsqueeze(1).expand_as(outputs[:, :, i])  # Shape: [32, 10]
-        features_std = batch_features_avgs[:, i, 1].unsqueeze(1).expand_as(outputs[:, :, i])   # Shape: [32, 10]
-
-        # Denormalize the i-th feature across all samples and time steps
-        outputs_denormalized[:, :, i] = outputs[:, :, i] * (features_std + 1e-8) + features_mean
+    # The model predicts each feature's change from the last input minute, in units of
+    # the input window's std, so an output of 0 means "same as the last minute". Use the
+    # input window's stats: the label window's stats aren't available at prediction time.
+    outputs_denormalized = outputs * (features_std + 1e-8) + batch_features[:, -1:, :]
 
     # Check for NaN values in outputs
     if torch.isnan(outputs).any() or torch.isnan(outputs_denormalized).any():
         return None
 
-    # Compute the loss comparing the denormalized outputs to the original labels
-    return criterion(outputs_denormalized, batch_labels)
+    # Compute the loss in normalized units: divide each error by the input window's std
+    # (floored), so every feature counts about equally. In original units, volume
+    # (thousands of shares) would swamp prices (dollars).
+    loss_scale = torch.maximum(features_std, std_floor)
+    return criterion(outputs_denormalized / loss_scale, batch_labels / loss_scale)
 
 def evaluate(loader):
     model.eval()
@@ -168,7 +163,8 @@ def evaluate(loader):
             num_batches += 1
     return total_loss / max(num_batches, 1)
 
-torch.autograd.set_detect_anomaly(True)
+# Debugging only: makes training ~15x slower. Uncomment to trace NaNs in the backward pass.
+# torch.autograd.set_detect_anomaly(True)
 
 for epoch in range(start_epoch, num_epochs):
     model.train()
@@ -198,10 +194,16 @@ for epoch in range(start_epoch, num_epochs):
             print(f'Progress: {progress} batches processed')
 
     avg_loss = total_loss / len(train_loader)
-    test_loss = evaluate(test_loader)
-    print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_loss:.4f}, Test Loss: {test_loss:.4f}')
+    val_loss = evaluate(val_loader)
+    print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_loss:.4f}, Val Loss: {val_loss:.4f}')
+
+    # Keep the weights from the epoch with the lowest validation loss
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), model_file)
+        print(f"New best validation loss, saved to {model_file}")
 
     # Save checkpoint
-    save_checkpoint(model, optimizer, epoch, checkpoint_file)
+    save_checkpoint(model, optimizer, epoch, best_val_loss, checkpoint_file)
 
-torch.save(model.state_dict(), "Minute_Stock_Transformer.pth")
+print(f"Best validation loss: {best_val_loss:.4f}, weights in {model_file}")
